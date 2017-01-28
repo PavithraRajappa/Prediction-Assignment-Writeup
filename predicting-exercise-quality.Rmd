@@ -1,0 +1,294 @@
+---
+title: "Predicting the quality of weight lifting exercises"
+author: "Sébastien Pujadas"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, autodep = TRUE)
+```
+
+<!-- The goal of your project is to predict the manner in which they did the exercise. This is the "classe" variable in the har set. You may use any of the other variables to predict with. You should create a report describing how you built your model, how you used cross validation, what you think the expected out of sample error is, and why you made the choices you did. You will also use your prediction model to predict 20 different test cases.
+
+Peer Review Portion
+
+Your submission for the Peer Review portion should consist of a link to a Github repo with your R markdown and compiled HTML file describing your analysis. Please constrain the text of the writeup to < 2000 words and the number of figures to be less than 5. It will make it easier for the graders if you submit a repo with a gh-pages branch so the HTML page can be viewed online (and you always want to make it easy on graders :-).
+-->
+
+
+## Executive summary
+
+In this analysis we create a model that predicts how well weights are lifted, based on measurements made by on-body sensors and a labelled training data set. Our model combines predictions made by a random forest model and a boosted trees model, reaching an accuracy of 99.31% (and an estimated out of sample error of 0.69%) and a kappa value of .991 on a validation data set containing 20% of the training data set. We also use our prediction model to predict 20 different test cases.
+
+*Note - The R code used to conduct this analysis can be found in the repository that this report was published in: https://github.com/spujadas/coursera-pml *
+
+## Introduction
+
+One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, our goal will be to use data from accelerometers – on the belt, forearm, arm, and dumbbell – of 6 participants, to assess how well weights are lifted.
+
+## Exploratory data analysis
+
+We first download the training data set and load it in R using `read.csv()` without any options.
+
+```{r load_raw_data}
+rm(list=ls())
+
+harTrainingFile <- "project-data/pml-training.csv"
+if (!file.exists(harTrainingFile)) {
+  harTrainingUrl <- 
+    "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+  download.file(harTrainingFile, url = harTrainingUrl)
+}
+
+harRaw <- read.csv(harTrainingFile)
+```
+
+We then perform some basic exploratory data analysis. 
+
+*Note – For the sake of readability the R output of our exploratory data analysis is not included here, but the interested reader can download the source of this report to reproduce our analysis.*
+
+```{r eda, results='hide'}
+head(harRaw)
+dim(harRaw)  # 19622 obs. of 160 variables
+
+str(harRaw)
+# countains many nums imported as factors, many NAs, metadata (e.g.
+# timestamps), error strings (#DIV/0)
+
+levels(harRaw$amplitude_yaw_belt)
+# factor w/ 4 levels: "", "#DIV/0", "0.00", "0.0000"
+
+summary(harRaw)
+
+table(colSums(is.na(harRaw)))
+# 60 columns have no NAs, 100 columns have 19216 NAs
+```
+
+This data set contains `r dim(harRaw)[1]` observations of `r dim(harRaw)[2]` variables. 
+
+The outcome variable that we want to predict is named `classe`, and according to the notes accompanying the data set (see References) its possible values are `A` through `E`, where `A` indicates that the activity (namely 10 repetitions of the unilateral dumbbell biceps curl) was performed exactly according to the specification, and `B` through `E` correspond to common mistakes made when lifting weights.
+
+In addition to actual physical measurements (e.g. arm sensors orientation, dumbbell sensors orientation), the observations include metadata, such as the number of the observation, the name of the user, and the date when the activity was performed. This metadata does not represent measurements of physical activity and should therefore not be used to predict how an activity is performed when building our model.
+
+Looking at the data, we see that:
+
+- Some values should be considered as not available, specifically when they are empty, or contain the string `NA` or `#DIV/0`.
+
+- 100 of the variables are mostly not populated (19216 missing values out of 19622 observations), and will therefore be ignored when building the model.
+
+## Data preparation
+
+We re-read the data set in R, this time treating values equal to `NA`, the empty string, or `#DIV/0` as not available.
+
+```{r init}
+harTrainingFile <- "project-data/pml-training.csv"
+if (!file.exists(harTrainingFile)) {
+  harTrainingUrl <- 
+    "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+  download.file(harTrainingFile, url = harTrainingUrl)
+}
+
+harRaw <- read.csv(harTrainingFile, na.strings = c("NA", "", "#DIV/0"))
+```
+
+We then discard all variables (i.e. columns) that are missing values. As discussed above, we also remove variables that represent observation metadata.
+
+```{r preparation}
+# remove columns containing NAs
+columnsWithoutNAs <- which(colSums(is.na(harRaw)) == 0)
+har <- harRaw[, columnsWithoutNAs]
+
+# remove observation metadata (observation number, user, timestamp, window):
+har <- har[, !names(har) %in% c("X", "user_name", "raw_timestamp_part_1",
+                                "raw_timestamp_part_2", "cvtd_timestamp",
+                                "new_window", "num_window")]
+```
+
+As the final part of the data preparation phase, we split our data set into a training set (containing 60% of the data), a testing set (20%), and a validation set (20%).
+
+```{r split_sets}
+library(caret)
+
+# set seed for reproducibility
+set.seed(9876)
+
+# training + testing (80%) and validation (20%) sets
+buildIndices <- createDataPartition(y = har$classe, p = .8, list = F)
+validationHAR <- har[-buildIndices,]
+buildDataHAR <- har[buildIndices,]
+
+# training (60%, i.e. 0.75*80%) and testing (20%) sets
+trainIndices <- createDataPartition(y = buildDataHAR$classe, p = .75, list = F)
+trainHAR = buildDataHAR[trainIndices,]
+testHAR = buildDataHAR[-trainIndices,]
+```
+
+## Model selection
+
+We train four classification-orientated models on the training set, using random forests (`rf` in R's `caret` package), boosted trees (`gbm`), support vector machine (`svm`), and linear discriminant analysis (`lda`).
+
+We train the models using 5-fold cross-validation. In other words, for each model and each candidate combination of tuning parameters (for instance, the tuning parameter for the random forest model is `mtry`, the number of randomly selected predictors), one fifth of the training data is held out and serves as a cross-validation set on which the accuracy is calculated after the model has been trained on the rest of the data. The best model is then fitted on the full training set.
+
+```{r training, results='hide', message=FALSE}
+# control parameters for training
+trainCtrl <- trainControl(method = "cv", number = 5)
+
+# we set the same random number seed before training each model to ensure that
+# the same resampling sets are used.
+
+# random forest
+set.seed(65464)
+modRf <- train(classe ~ ., method = "rf", data = trainHAR,
+               trControl = trainCtrl)
+
+# boosted trees
+set.seed(65464)
+modGbm <- train(classe ~ ., method="gbm", data = trainHAR,
+                trControl = trainCtrl)
+
+# support vector machine
+set.seed(65464)
+modSvm <- train(classe ~ ., method="svmLinear", data = trainHAR,
+                trControl = trainCtrl)
+
+# linear dicriminant analysis
+set.seed(65464)
+modLda <- train(classe ~ ., method="lda", data = trainHAR,
+                trControl = trainCtrl)
+```
+
+Before we use these models to predict classes on the test set, we compare their resampling distributions (noting that there are 5 resamples for each model as we used 5-fold cross-validation) to get a general idea of the difference in performance between the models, and to estimate the out of sample error.
+
+```{r resampling}
+# collect resamples
+results <- resamples(list(RF=modRf, GBM=modGbm, SVM=modSvm, LDA=modLda))
+
+# summary of the resampling distributions
+summary(results)
+
+# estimated out of sample errors
+estOseRf <- 1-mean(results$values[, "RF~Accuracy"])
+estOseGbm <- 1-mean(results$values[, "GBM~Accuracy"])
+estOseSvm <- 1-mean(results$values[, "SVM~Accuracy"])
+estOseLda <- 1-mean(results$values[, "LDA~Accuracy"])
+
+# dot plots of results
+dotplot(results)
+```
+
+Based on the mean accuracies on the resamples, we can estimate that the out of sample errors will be close to `r round(estOseRf*100, 2)`% for random forests, `r round(estOseGbm*100, 2)`% for boosted trees, `r round(estOseSvm*100, 2)`% for support vector machine, and `r round(estOseLda*100, 2)`% for linear dicriminant analysis. 
+
+We now use the models to predict the class of the activities in the testing data set, and calculate the accuracy (or, equivalently, the out of sample error) of the models on this set.
+
+```{r evaluate_testing}
+# random forest
+predRfTest <- predict(modRf, newdata=testHAR)
+cmRfTest <- confusionMatrix(testHAR$classe, predRfTest)
+accRfTest <- cmRfTest$overall[['Accuracy']]
+oseRfTest <- 1-accRfTest
+kappaRfTest  <- cmRfTest$overall[['Kappa']]
+
+# boosted trees
+predGbmTest <- predict(modGbm, newdata=testHAR)
+cmGbmTest <- confusionMatrix(testHAR$classe, predGbmTest)
+accGbmTest <- cmGbmTest$overall[['Accuracy']]
+oseGbmTest <- 1-accGbmTest
+kappaGbmTest  <- cmGbmTest$overall[['Kappa']]
+
+# support vector machine
+predSvmTest <- predict(modSvm, newdata=testHAR)
+cmSvmTest <- confusionMatrix(testHAR$classe, predSvmTest)
+accSvmTest <- cmSvmTest$overall[['Accuracy']]
+oseSvmTest <- 1-accSvmTest
+kappaSvmTest  <- cmSvmTest$overall[['Kappa']]
+
+# linear dicriminant analysis
+predLdaTest <- predict(modLda, newdata=testHAR)
+cmLdaTest <- confusionMatrix(testHAR$classe, predLdaTest)
+accLdaTest <- cmLdaTest$overall[['Accuracy']]
+oseLdaTest <- 1-accLdaTest
+kappaLdaTest  <- cmLdaTest$overall[['Kappa']]
+```
+
+After predicting the classes on the testing set, we obtain:
+
+- `r round(accRfTest*100, 1)`% accuracy on the testing set, or equivalently a `r round(oseRfTest*100, 2)`% out of sample error, and a kappa ($\kappa$) value of `r round(kappaRfTest, 3)`, for the model fitted using random forests.
+
+- `r round(accGbmTest*100, 1)`% accuracy (`r round(oseGbmTest*100, 1)`% out of sample error) and $\kappa=$ `r round(kappaGbmTest, 3)` for boosted trees.
+
+- `r round(accSvmTest*100, 1)`% accuracy (`r round(oseSvmTest*100, 1)`% out of sample error) and $\kappa=$ `r round(kappaSvmTest, 3)` for support vector machine.
+
+- `r round(accLdaTest*100, 1)`% accuracy (`r round(oseLdaTest*100, 1)`% out of sample error) and $\kappa=$ `r round(kappaLdaTest, 3)` for linear discrimimant analysis.
+
+The accuracy of the random forest model is excellent, and the accuracy of the boosted trees model is also very good. We also note that our estimations of the out of sample errors were quite close to the actual out of sample errors on the testing set.
+
+We then fit a model that combines the two best predictors, namely those produced by the random forest model and the boosted trees model, using a random forest, on the test set.
+
+```{r combine_pred}
+# fit a model that combines predictors
+predRfGbmTest <- data.frame(predRf = predRfTest, predGbm = predGbmTest,
+                               classe=testHAR$classe)
+modCombRfGbm <- train(classe ~ ., model = "rf", data=predRfGbmTest, 
+                 trControl = trainCtrl)
+
+# predict on testing set
+predCombPredTest <- predict(modCombRfGbm, predRfGbmTest)
+```
+
+We use this final model to predict the classes on the validation set, and display the resulting confusion matrix.
+
+```{r predict_validation}
+# first predict using the random forest and boosted trees models
+predRfValidation <- predict(modRf, newdata=validationHAR)
+predGbmValidation <- predict(modGbm, newdata=validationHAR)
+
+# feed these predictions into our final model
+predCombRfGbmValidation <- predict(modCombRfGbm, 
+                              newdata=data.frame(predRf = predRfValidation, 
+                                                 predGbm = predGbmValidation))
+
+# confusion matrix
+cmCombRfGbmValidation <- confusionMatrix(testHAR$classe, 
+                                         predCombRfGbmValidation)
+cmCombRfGbmValidation$table
+
+# accuracy, out of sample error, kappa on validation set
+accCombRfGbmValidation <- cmCombRfGbmValidation$overall[['Accuracy']]
+oseCombRfGbmValidation <- 1-accCombRfGbmValidation
+kappaCombRfGbmValidation  <- cmCombRfGbmValidation$overall[['Kappa']]
+```
+
+The final model has an accuracy on the validation set of `r round(accCombRfGbmValidation*100, 1)`% and a $\kappa$ value of `r round(kappaCombRfGbmValidation, 3)`, which is slightly better than the already excellent accuracy of the random forest model.
+
+We expect that the out of sample error for our final model will be close to `r round(oseCombRfGbmValidation*100, 2)`%, the out of sample error on the validation set.
+
+## Predictions
+
+To make the final predictions, we first load the test cases, removing non-available values as we did for the training data file. We then use the previously fitted random forest and boosted trees models to make our first set of predictions, which we then pass to our model that combines the two predictors.
+
+```{r predictions}
+harTestingFile <- "project-data/pml-testing.csv"
+if (!file.exists(harTestingFile)) {
+  harTestingUrl <- 
+    "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+  download.file(harTestingFile, url = harTestingUrl)
+}
+
+testCases <- read.csv(harTestingFile, na.strings = c("NA", "", "#DIV/0"))
+predTestCasesRf <- predict(modRf, newdata=testCases)
+predTestCasesGbm <- predict(modGbm, newdata=testCases)
+
+# prediction
+predTestCasesCombModFit <- predict(modCombRfGbm, 
+                                   newdata = data.frame(
+                                     predRf = predTestCasesRf, 
+                                     predGbm = predTestCasesGbm))
+```
+
+The resulting predicted classes for the test cases are: `r predTestCasesCombModFit`.
+
+It may be noted that the original (i.e. pre-combination) predictors yield the same classes, as the underlying models were very accurate to begin with.
+
+## References
+
+Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. [Qualitative Activity Recognition of Weight Lifting Exercises](http://groupware.les.inf.puc-rio.br/work.jsf?p1=11201). Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13). Stuttgart, Germany: ACM SIGCHI, 2013. Website: http://groupware.les.inf.puc-rio.br/har
